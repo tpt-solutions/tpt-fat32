@@ -1,0 +1,118 @@
+tpt-fat32 Design Specification
+1. Purpose and Vision
+The purpose of tpt-fat32 is to provide the safest, fastest, and most robust no_std FAT32 filesystem driver for edge devices, robotics, and embedded systems.
+It strictly adheres to the standard Microsoft FAT32 on-disk format, ensuring 100% compatibility with Windows, Linux, macOS, and microcontrollers. The "improvement" lies entirely in the software implementation: eliminating driver-induced corruption, optimizing for flash storage, and providing mathematically verified crash-consistency and repair mechanisms that the original FAT32 design lacks.
+2. What We Propose to Improve (The "Delta")
+Since we cannot change the on-disk format, we improve FAT32 by fixing its historical flaws at the driver and API level:
+A. Software-Level Crash Consistency (Fixing Power-Loss Corruption)
+FAT32 is notoriously fragile during sudden power loss because it lacks a journal. We will fix this in software via Strict Write Ordering:
+The Golden Rule of Writes: We will enforce a strict sequence for all file operations:
+Write Data clusters.
+Update FAT chain (link new clusters, marking EOF).
+Update Directory Entry (size/timestamps) last, so it never points at an unterminated or unallocated chain.
+Flush caches in reverse order.
+(Design note: spec.txt originally listed the directory entry before the FAT chain. It was swapped because a power loss between those two steps could leave the entry pointing at an unlinked chain.)
+Result: If power is lost, the filesystem will never enter an unrecoverable state. At worst, a file might be truncated to its previous size, or a cluster might be "lost" (which our built-in repair tool will safely reclaim).
+B. Mathematical Correctness & Verification
+Standard FAT32 drivers often suffer from infinite loops (if a FAT chain cycles back on itself) or out-of-bounds panics.
+Verified FAT Traversal: We will use formal verification (e.g., Kani) to mathematically prove that the FAT chain walker will always terminate and never read out of bounds, even on maliciously corrupted disk images.
+Panic-Free Parsing: All on-disk structure parsing will be strictly bounds-checked and zero-copy, guaranteeing no panics on malformed media.
+C. Flash & Edge Optimization
+Standard FAT32 allocates clusters pseudo-randomly, causing massive write-amplification on raw flash/SD cards.
+Sequential Allocation Strategy: The allocator will be modified to prefer contiguous, sequential cluster allocation. This creates larger sequential writes, allowing the underlying hardware Flash Translation Layer (FTL) to perform wear-leveling much more efficiently.
+FSInfo Optimization: We will minimize writes to the FSInfo sector (which tracks free clusters) to prevent unnecessary wear on that specific flash block, updating it only during clean unmounts or periodic intervals.
+D. Built-in, Verified Repair (FSCK)
+Instead of relying on external OS tools, tpt-fat32 will include a lightweight, mathematically verified repair module.
+It will safely detect FAT/Directory mismatches.
+It will safely cross-link files and reclaim "lost chains" (allocated FAT clusters not pointed to by any directory) without corrupting valid data.
+E. Zero-Copy & no_std Performance
+Zero Allocations: The core driver will operate with zero heap allocations.
+Zero-Copy Parsing: Boot sectors, FAT entries, and directory entries will be parsed directly from the block device buffer using zerocopy or safe equivalents.
+Smart Caching: An LRU cache for FAT and Directory sectors to minimize redundant I/O operations, which is critical for slow SD cards and eMMC.
+3. Technical Architecture
+The repository will be structured as a no_std Rust workspace, divided into logical modules:
+3.1. tpt-fat32-core (Traits & Zero-Copy Structures)
+BlockDevice Trait: Async/sync agnostic trait for sector read/write/flush.
+OnDisk Structs: Zero-copy representations of the BPB (BIOS Parameter Block), FAT32 FSInfo, FAT entries, and 32-byte Directory Entries.
+Time Module: Conversion between FAT's 1980-based time format and standard Unix timestamps.
+3.2. tpt-fat32-driver (The Core Filesystem)
+Volume Manager: Handles mounting, reading the BPB, and managing the FSInfo sector.
+Allocator: The cluster allocation engine. Implements the Sequential Allocation Strategy to optimize for flash wear-leveling.
+Directory Walker: Safe, verified traversal of directory trees, handling LFN (Long File Name) 8.3 short name checksums correctly.
+File & Dir Handles: The API exposed to the user for reading, writing, seeking, and creating files.
+3.3. tpt-fat32-repair (The FSCK Module)
+Invariant Checker: Scans the FAT and Directory structures to find mismatches.
+Safe Reclaimer: Algorithms to safely truncate corrupted files or move lost chains into a /FOUND.000 style recovery directory.
+4. Formal Verification Strategy
+Because edge devices (like automotive ECUs or robots) cannot afford filesystem corruption, correctness is paramount.
+Memory Safety: Enforced via Rust's type system. No unsafe blocks in the parsing logic.
+Logical Invariants (Kani/Prusti):
+Termination: The FAT chain walker will always reach an EOF marker or a Bad Cluster marker within total_clusters steps.
+LFN Integrity: The checksum of an 8.3 short name will perfectly match the associated LFN entries.
+Write Ordering: The state machine for file creation/modification will be proven to never leave the FAT and Directory in an inconsistent state if interrupted.
+Fuzzing: cargo fuzz will target the BlockDevice read interface, feeding random/mutated sector data to ensure the driver gracefully returns Error::Corrupted instead of panicking.
+5. Initial Roadmap
+Phase 1: Foundation & Zero-Copy Parsing (Weeks 1-3)
+Set up the no_std workspace and BlockDevice traits.
+Implement zero-copy parsing for the Boot Sector (BPB) and FSInfo.
+Implement safe, verified parsing of FAT entries and Directory Entries (including LFN logic).
+Phase 2: Core Driver & Allocator (Weeks 4-6)
+Implement the cluster allocator with the sequential/contiguous preference strategy.
+Implement directory traversal and file read/write logic.
+Implement the strict write-ordering state machine for crash consistency.
+Phase 3: Verification & Repair (Weeks 7-9)
+Write Kani proofs for the FAT chain walker and write-ordering logic.
+Implement the tpt-fat32-repair module to handle lost chains and cross-linked files.
+Set up the fuzzing harness for disk image corruption.
+
+The Workspace Structure
+The repository will be structured as a Rust workspace with the following crates:
+1. tpt-fat32 (The Core Driver)
+Type: no_std library (can optionally use alloc if dynamic allocation is needed for caching, but pure no_std is the goal).
+Purpose: This is the actual filesystem. It contains the zero-copy on-disk parsers, the BlockDevice traits, the cluster allocator, the directory walker, and the strict write-ordering state machine.
+Target: Embedded devices, robots, automotive ECUs, and the tpt-archon stack.
+2. tpt-fat32-repair (The FSCK Tool)
+Type: std binary and library.
+Purpose: The crash-recovery and repair module. It reads raw disk images (or block devices) from the host OS, runs the mathematical invariant checks, fixes FAT/Directory mismatches, and reclaims lost chains.
+Target: Host machines (Linux/Windows/macOS) used by developers or maintenance systems to fix corrupted SD cards.
+3. tpt-fat32-fuzz (Fuzzing Harness)
+Type: std binary (used only in CI/development).
+Purpose: A dedicated crate for cargo fuzz. It takes mutated, malformed byte arrays and feeds them into the tpt-fat32 core parser to guarantee it never panics or triggers an out-of-bounds memory read.
+The Directory Tree
+Here is what the actual repository folder structure will look like:
+
+tpt-fat32/
+├── Cargo.toml                 # Workspace root definition
+├── README.md                  # High-level overview
+├── SPEC.md                    # The design specification we just discussed
+│
+├── crates/
+│   ├── tpt-fat32/             # [CRATE 1] The core no_std driver
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs         # Public API (Volume, File, Dir)
+│   │       ├── block.rs       # BlockDevice trait
+│   │       ├── bpb.rs         # Zero-copy BIOS Parameter Block parser
+│   │       ├── fat.rs         # FAT chain traversal & allocator
+│   │       ├── dir.rs         # Directory & LFN parsing
+│   │       └── error.rs       # Infallible error types
+│   │
+│   ├── tpt-fat32-repair/      # [CRATE 2] The std repair/fsck tool
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs        # CLI entrypoint
+│   │       ├── checker.rs     # Invariant verification logic
+│   │       └── reclaimer.rs   # Lost chain recovery
+│   │
+│   └── tpt-fat32-fuzz/        # [CRATE 3] Fuzzing targets
+│       ├── Cargo.toml
+│       └── src/
+│           └── fuzz_bpb.rs    # Fuzzing the boot sector parser
+│
+└── tests/                     # Workspace-level integration tests
+    └── loopback.rs            # Tests using a virtual RAM disk
+
+
+
+## License
+MIT OR Apache-2.0. Copyright (c) 2026 TPT Solutions.
